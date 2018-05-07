@@ -16,6 +16,7 @@ use Hash::Util qw(lock_hash);
 use Image::Magick;
 use JSON::XS;
 use Moose::Role;
+use IPC::Run3 qw(run3);
 use Sys::Statistics::Linux;
 use IPTables::ChainMgr;
 
@@ -32,6 +33,8 @@ our $MIN_FREE_MEMORY = 1024*1024;
 our $IPTABLES_CHAIN = 'RAVADA';
 
 our %PROPAGATE_FIELD = map { $_ => 1} qw( run_timeout );
+
+our $TIME_CACHE_NETSTAT = 10; # seconds to cache netstat data output
 
 _init_connector();
 
@@ -176,7 +179,10 @@ after '_select_domain_db' => \&_post_select_domain_db;
 
 around 'get_info' => \&_around_get_info;
 
+around 'is_active' => \&_around_is_active;
+
 around 'autostart' => \&_around_autostart;
+
 ##################################################
 #
 
@@ -258,7 +264,7 @@ sub _allow_remove($self, $user) {
     confess "ERROR: Undefined user" if !defined $user;
 
     die "ERROR: remove not allowed for user ".$user->name
-        if (!$user->can_remove());
+        unless $user->can_remove_machine($self);
 
     $self->_check_has_clones() if $self->is_known();
     if ( $self->is_known
@@ -268,7 +274,6 @@ sub _allow_remove($self, $user) {
         my $base = $self->open($self->id_base);
         return if ($user->can_remove_clone_all() || ($base->id_owner == $user->id));
     }
-    $self->_allowed($user);
 
 }
 
@@ -463,7 +468,7 @@ sub _allowed {
     my $err = $@;
 
     confess "User ".$user->name." [".$user->id."] not allowed to access ".$self->domain
-        ." owned by ".($id_owner or '<UNDEF>')."\n".Dumper($self)
+        ." owned by ".($id_owner or '<UNDEF>')
             if (defined $id_owner && $id_owner != $user->id );
 
     confess $err if $err;
@@ -517,6 +522,7 @@ sub _data($self, $field, $value=undef) {
 
         confess "ERROR: Invalid field '$field'"
             if $field !~ /^[a-z]+[a-z0-9_]*$/;
+
         my $sth = $$CONNECTOR->dbh->prepare(
             "UPDATE domains set $field=? WHERE id=?"
         );
@@ -1222,6 +1228,22 @@ sub _post_shutdown {
     }
 }
 
+sub _around_is_active($orig, $self) {
+    my $is_active = $self->$orig();
+    return $is_active if $self->readonly
+        || !$self->is_known
+        || (defined $self->_data('id_vm') && $self->_vm->id != $self->_data('id_vm'));
+
+    #TODO check hibernated machines status
+    my $status = 'shutdown';
+    $status = 'active'  if $is_active;
+    $self->_data(status => $status);
+
+    $self->display(Ravada::Utils::user_daemon())    if $is_active;
+
+    return $is_active;
+}
+
 sub _around_shutdown_now {
     my $orig = shift;
     my $self = shift;
@@ -1437,6 +1459,7 @@ sub open_iptables {
     $args{user} = $user;
     delete $args{uid};
 
+    $self->_data('client_status','connecting...');
     $self->_remove_iptables();
     $self->_add_iptable(%args);
 }
@@ -1918,6 +1941,93 @@ Returns the internal id of this domain as found in its Virtual Manager connectio
 sub internal_id {
     my $self = shift;
     return $self->id;
+}
+
+=head2 volatile_clones
+
+Enables or disables a domain volatile clones feature. Volatile clones are
+removed when shut down
+
+=cut
+
+sub volatile_clones($self, $value=undef) {
+    return $self->_data('volatile_clones', $value);
+}
+
+=head2 status
+
+Sets or gets the status of a virtual machine
+
+  $machine->status('active');
+
+Valid values are:
+
+=over
+
+=item * active
+
+=item * down
+
+=item * hibernated
+
+=back
+
+=cut
+
+sub status($self, $value=undef) {
+    confess "ERROR: the status can't be updated on read only mode."
+        if $self->readonly;
+    return $self->_data('status', $value);
+}
+
+sub client_status($self, $force=0) {
+    return if !$self->is_active;
+    return if !$self->remote_ip;
+
+    return $self->_data('client_status')    if $self->readonly;
+
+    my $time_checked = time - $self->_data('client_status_time_checked');
+    if ( $time_checked < $TIME_CACHE_NETSTAT && !$force ) {
+        return $self->_data('client_status');
+    }
+
+    my $status = $self->_client_connection_status( $force );
+    $self->_data('client_status', $status);
+    $self->_data('client_status_time_checked', time );
+
+    return $status;
+}
+
+sub _run_netstat($self, $force=undef) {
+    if (!$force && $self->_vm->{_netstat}
+        && ( time - $self->_vm->{_netstat_time} < $TIME_CACHE_NETSTAT+1 ) ) {
+        return $self->_vm->{_netstat};
+    }
+    my @cmd = ("netstat", "-tan");
+    my ($in, $out, $err);
+    run3(\@cmd, \$in, \$out, \$err);
+    $self->_vm->{_netstat} = $out;
+    $self->_vm->{_netstat_time} = time;
+
+    return $out;
+}
+
+sub _client_connection_status($self, $force=undef) {
+    #TODO: this should be run in the VM
+    #       in develop release VM->run_command does exists
+    my $display = $self->display(Ravada::Utils::user_daemon());
+    my ($ip, $port) = $display =~ m{\w+://(.*):(\d+)};
+    die "No ip in $display" if !$ip;
+
+    my $netstat_out = $self->_run_netstat($force);
+    my @out = split(/\n/,$netstat_out);
+    for my $line (@out) {
+        my @netstat_info = split(/\s+/,$line);
+        if ( $netstat_info[3] eq $ip.":".$port ) {
+            return 'connected' if $netstat_info[5] eq 'ESTABLISHED';
+        }
+    }
+    return 'disconnected';
 }
 
 1;

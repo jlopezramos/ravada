@@ -10,11 +10,18 @@
     <div class="page-header">
         <div class="panel panel-default">
              <div class="panel-heading">
-                 <h2>Virtual Machine 
+%              if ($domain->is_base) {
+                 <h2><%=l 'Virtual Machine' %>
+                     <b><%= $domain->name %></b>
+                     <%=l 'Settings' %>
+                 </h2>
+%               } else {
+                 <h2><%=l 'Virtual Machine' %>
                      <a ng-hide="domain_remove_done" 
                          href="/machine/view/<%= $domain->id %>.html"><%= $domain->name %></a>
-                     Settings
+                     <%=l 'Settings' %>
                  </h2>
+%               }
              </div> <!-- del panel heading-->
             <div class="tab-content">
                 %= include 'main/settings_machine_tabs_head'

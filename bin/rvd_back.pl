@@ -13,9 +13,13 @@ use Ravada;
 use Ravada::Auth::SQL;
 use Ravada::Auth::LDAP;
 
+$|=1;
+
 my $help;
 
 my ($DEBUG, $ADD_USER );
+
+my $VERBOSE = $ENV{TERM};
 
 my $FILE_CONFIG_DEFAULT = "/etc/ravada.conf";
 my $FILE_CONFIG;
@@ -28,10 +32,12 @@ my $NOFORK;
 my $MAKE_ADMIN_USER;
 my $REMOVE_ADMIN_USER;
 my $START = 1;
+my $TEST_LDAP;
 
 my $URL_ISOS;
 my $ALL;
 my $HIBERNATED;
+my $DISCONNECTED;
 
 my $LIST;
 
@@ -44,6 +50,7 @@ my $IMPORT_DOMAIN_OWNER;
 my $USAGE = "$0 "
         ." [--debug] [--config=$FILE_CONFIG_DEFAULT] [--add-user=name] [--add-user-ldap=name]"
         ." [--change-password] [--make-admin=username] [--import-vbox=image_file.vdi]"
+        ." [--test-ldap] "
         ." [-X] [start|stop|status]"
         ."\n"
         ." --add-user : adds a new db user\n"
@@ -67,6 +74,7 @@ my $USAGE = "$0 "
         ." --all : execute on all virtual machines\n"
         ."          For hibernate, it is executed on all the actives\n"
         ." --hibernated: execute on hibernated machines\n"
+        ." --disconnected: execute on disconnected machines\n"
         ."\n"
     ;
 
@@ -80,10 +88,12 @@ GetOptions (       help => \$help
              ,'start=s' => \$START_DOMAIN
              ,'config=s'=> \$FILE_CONFIG
            ,'hibernated'=> \$HIBERNATED
+            ,'test-ldap'=> \$TEST_LDAP
            ,'add-user=s'=> \$ADD_USER
            ,'url-isos=s'=> \$URL_ISOS
            ,'shutdown:s'=> \$SHUTDOWN_DOMAIN
           ,'hibernate:s'=> \$HIBERNATE_DOMAIN
+         ,'disconnected'=> \$DISCONNECTED
         ,'make-admin=s' => \$MAKE_ADMIN_USER
       ,'remove-admin=s' => \$REMOVE_ADMIN_USER
       ,'change-password'=> \$CHANGE_PASSWORD
@@ -109,11 +119,12 @@ die "Only root can do that\n" if $> && ( $ADD_USER || $ADD_USER_LDAP || $IMPORT_
 die "ERROR: Missing file config $FILE_CONFIG\n"
     if $FILE_CONFIG && ! -e $FILE_CONFIG;
 
-die "ERROR: Shutdown requires a domain name, or --all or --hibernated\n"
-    if defined $SHUTDOWN_DOMAIN && !$SHUTDOWN_DOMAIN && !$ALL && !$HIBERNATED;
+die "ERROR: Shutdown requires a domain name, or --all , --hibernated , --disconnected\n"
+    if defined $SHUTDOWN_DOMAIN && !$SHUTDOWN_DOMAIN && !$ALL && !$HIBERNATED
+                                && !$DISCONNECTED;
 
-die "ERROR: Hibernate requires a domain name, or --all\n"
-    if defined $HIBERNATE_DOMAIN && !$HIBERNATE_DOMAIN && !$ALL;
+die "ERROR: Hibernate requires a domain name, or --all , --disconnected\n"
+    if defined $HIBERNATE_DOMAIN && !$HIBERNATE_DOMAIN && !$ALL && !$DISCONNECTED;
 
 my %CONFIG;
 %CONFIG = ( config => $FILE_CONFIG )    if $FILE_CONFIG;
@@ -218,6 +229,8 @@ sub add_user {
 
 sub add_user_ldap {
     my $login = shift;
+
+    my $ravada = Ravada->new( %CONFIG);
 
     print "password : ";
     my $password = <STDIN>;
@@ -342,6 +355,12 @@ sub list {
         print $domain->name."\t";
         if ($domain->is_active) {
             print "active";
+            my $status = $domain->client_status;
+            if ( $domain->remote_ip ) {
+                $status .= " , "    if $status;
+                $status .= $domain->remote_ip;
+            }
+            print " ( $status ) " if $status;
         } elsif ($domain->is_hibernated) {
             print "hibernated";
         } else {
@@ -362,15 +381,22 @@ sub hibernate {
     my $found = 0;
     for my $domain ($rvd_back->list_domains) {
         if ( ($all && $domain->is_active)
-                || ($domain_name && $domain->name eq $domain_name)) {
+                || ($domain_name && $domain->name eq $domain_name)
+                || ($DISCONNECTED && $domain->client_status
+                        && $domain->client_status eq 'disconnected')
+           ) {
             $found++;
             if (!$domain->is_active) {
                 warn "WARNING: Virtual machine ".$domain->name
                     ." is already down.\n";
                 next;
             }
+            if ( $DISCONNECTED && $domain->client_status
+                    && $domain->client_status eq 'disconnected') {
+                next if _verify_connection($domain);
+            }
             if ($domain->can_hibernate) {
-                $domain->hibernate();
+                $domain->hibernate( $Ravada::USER_DAEMON);
                 $down++;
             } else {
                 warn "WARNING: Virtual machine ".$domain->name
@@ -382,7 +408,7 @@ sub hibernate {
     }
     print "$down machines hibernated.\n";
     warn "ERROR: Domain $domain_name not found.\n"
-        if !$all && !$found;
+        if !$domain_name && !$found;
 }
 
 sub start_domain {
@@ -421,9 +447,12 @@ sub shutdown_domain {
 
     my $down = 0;
     my $found = 0;
+    DOMAIN:
     for my $domain ($rvd_back->list_domains) {
         if ((defined $domain_name && $domain->name eq $domain_name)
             || ($hibernated && $domain->is_hibernated)
+            || ($DISCONNECTED
+                    && ( $domain->client_status && $domain->client_status eq 'disconnected' ))
             || $all ){
             $found++;
             if (!$domain->is_active && !$domain->is_hibernated) {
@@ -435,14 +464,59 @@ sub shutdown_domain {
             if ($domain->is_hibernated) {
                 $domain->start(user => $Ravada::USER_DAEMON);
             }
-            $domain->shutdown(user => $Ravada::USER_DAEMON, timeout => 60);
+            if ($DISCONNECTED && $domain->client_status
+                    && $domain->client_status eq 'disconnected') {
+
+                next DOMAIN if _verify_connection($domain);
+            }
             print "Shutting down ".$domain->name.".\n";
+            eval { $domain->shutdown(user => $Ravada::USER_DAEMON, timeout => 300) };
+            warn $@ if $@;
             $down++;
         }
     }
     warn "ERROR: Domain $domain_name not found.\n"
         if $domain_name && !$found;
     print "$down domains shut down.\n";
+}
+
+sub _verify_connection {
+    my $domain = shift;
+    print "Verifying connection for ".$domain->name
+                        ." ".($domain->remote_ip or '')." "
+        if $VERBOSE;
+    for ( 1 .. 25 ) {
+        if ( $domain->client_status(1)
+                            && $domain->client_status(1) ne 'disconnected' ) {
+            print "\n\t".$domain->client_status." ".$domain->remote_ip
+                            ." Shutdown dismissed.\n";
+            return 1;
+        }
+        print "." if $VERBOSE && !($_ % 5);
+        sleep 1;
+     }
+     print "\n" if $VERBOSE;
+    return 0;
+}
+
+sub test_ldap {
+    my $rvd_back = Ravada->new(%CONFIG);
+    eval { Ravada::Auth::LDAP::_init_ldap_admin() };
+    die "No LDAP connection, error: $@\n" if $@;
+    print "Connection to LDAP ok\n";
+    print "login: ";
+    my $name=<STDIN>;
+    chomp $name;
+    print "password: ";
+    my $password = <STDIN>;
+    chomp $password;
+    my $ok= Ravada::Auth::login( $name, $password);
+    if ($ok) {
+        print "LOGIN OK $ok->{_auth}\n";
+    } else {
+        print "LOGIN FAILED\n";
+    }
+    exit;
 }
 
 sub DESTROY {
@@ -463,13 +537,14 @@ sub DESTROY {
 my $rvd_back = Ravada->new(%CONFIG);
 
 add_user($ADD_USER)                 if $ADD_USER;
-add_user($ADD_USER_LDAP)            if $ADD_USER_LDAP;
+add_user_ldap($ADD_USER_LDAP)       if $ADD_USER_LDAP;
 change_password()                   if $CHANGE_PASSWORD;
 import_domain($IMPORT_DOMAIN)       if $IMPORT_DOMAIN;
 import_vbox($IMPORT_VBOX)           if $IMPORT_VBOX;
 make_admin($MAKE_ADMIN_USER)        if $MAKE_ADMIN_USER;
 remove_admin($REMOVE_ADMIN_USER)    if $REMOVE_ADMIN_USER;
 set_url_isos($URL_ISOS)             if $URL_ISOS;
+test_ldap                           if $TEST_LDAP;
 
 list($ALL)                          if $LIST;
 hibernate($HIBERNATE_DOMAIN , $ALL) if defined $HIBERNATE_DOMAIN;
